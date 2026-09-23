@@ -139,9 +139,29 @@ pub enum Message {
 }
 
 impl Message {
+    /// Some Qualcomm modems (observed on SDX55 / Inseego MiFi M2100) wrap every
+    /// message in an 8-byte multi-radio header before the usual diag payload:
+    ///
+    /// ```text
+    /// 98 01 00 00 | 01 00 00 00 | 10 00 7c 00 7c 00 14 b1 ...
+    /// \_ 0x98 tag _/ \_ subscr. _/ \_ ordinary Message (0x10 = Log) ...
+    /// ```
+    ///
+    /// The wrapper sits *inside* the HDLC frame and is covered by its CRC, so
+    /// decapsulation succeeds and only the subsequent parse fails -- the leading
+    /// 0x98 is read as a Response opcode, yielding
+    /// "ID 408 not found on ResponsePayload" (408 == 0x0198).
+    fn strip_multi_radio_header(data: &[u8]) -> &[u8] {
+        if data.len() > 8 && data[0] == 0x98 && data[1] == 0x01 && data[2] == 0 && data[3] == 0 {
+            &data[8..]
+        } else {
+            data
+        }
+    }
+
     pub fn from_hdlc(data: &[u8]) -> Result<Message, DiagParsingError> {
         match hdlc_decapsulate(data, &CRC_CCITT) {
-            Ok(data) => match Message::from_bytes((&data, 0)) {
+            Ok(data) => match Message::from_bytes((Message::strip_multi_radio_header(&data), 0)) {
                 Ok(((leftover_bytes, _), res)) => {
                     if !leftover_bytes.is_empty() {
                         warn!(
