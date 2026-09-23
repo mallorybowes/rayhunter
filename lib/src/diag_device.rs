@@ -310,53 +310,123 @@ struct DiagLoggingModeParam {
     mode_param: u8,
 }
 
-// Triggers the diag device's debug logging mode
+// msm-4.x extended layout (SDX55 / kernel 4.14 and later). The driver does a
+// strict `len == sizeof(struct diag_logging_mode_param_t)` check and returns
+// -EINVAL on anything else, so the 12-byte struct above is rejected outright
+// on these kernels even though the pointer is perfectly valid.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct DiagLoggingModeParamV2 {
+    req_mode: u32,
+    peripheral_mask: u32,
+    pd_mask: u32,
+    mode_param: u8,
+    diag_id: u8,
+    pd_val: u8,
+    reserved: u8,
+    peripheral: i32,
+}
+
+// Same, plus the `device_mask` field present in some vendor trees.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct DiagLoggingModeParamV3 {
+    req_mode: u32,
+    peripheral_mask: u32,
+    pd_mask: u32,
+    mode_param: u8,
+    diag_id: u8,
+    pd_val: u8,
+    reserved: u8,
+    peripheral: i32,
+    device_mask: i32,
+}
+
+// Triggers the diag device's debug logging mode.
+//
+// Kernels differ in what this ioctl accepts. Older ones take the mode as a bare
+// int; msm-4.x takes a pointer to a struct and enforces an exact size match,
+// returning -EINVAL for any other length. Rather than guess, walk a ladder of
+// known shapes and log what each one returns, so a total failure still yields a
+// usable bug report.
 fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> DiagResult<()> {
+    // DIAG_CON_ALL on most trees is the OR of the per-peripheral bits; u32::MAX
+    // is what rayhunter historically sent and some drivers reject it.
+    const MASKS: [(u32, &str); 3] = [
+        (u32::MAX, "u32::MAX"),
+        (0x0000_00ff, "0xff (DIAG_CON_ALL, 8 peripherals)"),
+        (0x0000_007f, "0x7f (DIAG_CON_ALL, 7 peripherals)"),
+    ];
+
     unsafe {
-        if libc::ioctl(fd, DIAG_IOCTL_SWITCH_LOGGING, mode, 0, 0, 0) < 0 {
-            let mut try_params = vec![DiagLoggingModeParam {
-                req_mode: mode,
-                peripheral_mask: u32::MAX,
-                mode_param: 0,
-            }];
-            if configured_device == &Device::Tplink {
-                // tplink M7350 HW revision 3-8 need this mode
-                try_params.insert(
-                    0,
-                    DiagLoggingModeParam {
-                        req_mode: mode,
-                        peripheral_mask: 0,
-                        mode_param: 1,
-                    },
-                );
-            }
-
-            let mut ret = 0;
-
-            for params in &try_params {
-                let mut params = *params;
-                ret = libc::ioctl(
-                    fd,
-                    DIAG_IOCTL_SWITCH_LOGGING,
-                    &mut params as *mut DiagLoggingModeParam,
-                    std::mem::size_of::<DiagLoggingModeParam>(),
-                    0,
-                    0,
-                    0,
-                    0,
-                );
-                if ret == 0 {
-                    break;
-                }
-            }
-
-            if ret < 0 {
-                let msg = format!("DIAG_IOCTL_SWITCH_LOGGING ioctl failed with error code {ret}");
-                return Err(DiagDeviceError::InitializationFailed(msg));
-            }
+        // 1. legacy int form
+        let r = libc::ioctl(fd, DIAG_IOCTL_SWITCH_LOGGING, mode, 0, 0, 0);
+        log::info!(
+            "diag probe: int form           -> ret={r} errno={:?}",
+            std::io::Error::last_os_error()
+        );
+        if r == 0 {
+            return Ok(());
         }
+
+        // 2. tplink-specific 12-byte variant, tried first on that hardware
+        if configured_device == &Device::Tplink {
+            let mut p = DiagLoggingModeParam { req_mode: mode, peripheral_mask: 0, mode_param: 1 };
+            let r = libc::ioctl(
+                fd, DIAG_IOCTL_SWITCH_LOGGING,
+                &mut p as *mut DiagLoggingModeParam,
+                std::mem::size_of::<DiagLoggingModeParam>(), 0, 0, 0, 0,
+            );
+            log::info!("diag probe: v1 tplink (12B)    -> ret={r} errno={:?}",
+                std::io::Error::last_os_error());
+            if r == 0 { return Ok(()); }
+        }
+
+        for (mask, label) in MASKS {
+            // 12-byte original
+            let mut p1 = DiagLoggingModeParam { req_mode: mode, peripheral_mask: mask, mode_param: 0 };
+            let r = libc::ioctl(
+                fd, DIAG_IOCTL_SWITCH_LOGGING,
+                &mut p1 as *mut DiagLoggingModeParam,
+                std::mem::size_of::<DiagLoggingModeParam>(), 0, 0, 0, 0,
+            );
+            log::info!("diag probe: v1 ({:>2}B) mask={label} -> ret={r} errno={:?}",
+                std::mem::size_of::<DiagLoggingModeParam>(), std::io::Error::last_os_error());
+            if r == 0 { return Ok(()); }
+
+            // 20-byte msm-4.x
+            let mut p2 = DiagLoggingModeParamV2 {
+                req_mode: mode, peripheral_mask: mask, pd_mask: 0,
+                mode_param: 0, diag_id: 0, pd_val: 0, reserved: 0, peripheral: 0,
+            };
+            let r = libc::ioctl(
+                fd, DIAG_IOCTL_SWITCH_LOGGING,
+                &mut p2 as *mut DiagLoggingModeParamV2,
+                std::mem::size_of::<DiagLoggingModeParamV2>(), 0, 0, 0, 0,
+            );
+            log::info!("diag probe: v2 ({:>2}B) mask={label} -> ret={r} errno={:?}",
+                std::mem::size_of::<DiagLoggingModeParamV2>(), std::io::Error::last_os_error());
+            if r == 0 { return Ok(()); }
+
+            // 24-byte with device_mask
+            let mut p3 = DiagLoggingModeParamV3 {
+                req_mode: mode, peripheral_mask: mask, pd_mask: 0,
+                mode_param: 0, diag_id: 0, pd_val: 0, reserved: 0, peripheral: 0, device_mask: 1,
+            };
+            let r = libc::ioctl(
+                fd, DIAG_IOCTL_SWITCH_LOGGING,
+                &mut p3 as *mut DiagLoggingModeParamV3,
+                std::mem::size_of::<DiagLoggingModeParamV3>(), 0, 0, 0, 0,
+            );
+            log::info!("diag probe: v3 ({:>2}B) mask={label} -> ret={r} errno={:?}",
+                std::mem::size_of::<DiagLoggingModeParamV3>(), std::io::Error::last_os_error());
+            if r == 0 { return Ok(()); }
+        }
+
+        Err(DiagDeviceError::InitializationFailed(
+            "DIAG_IOCTL_SWITCH_LOGGING: every known parameter shape was rejected".to_string(),
+        ))
     }
-    Ok(())
 }
 
 // Unsure of what MDM actually stands for, but if `use_mdm` is > 0, then
