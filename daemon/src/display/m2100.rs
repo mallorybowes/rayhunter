@@ -1,33 +1,45 @@
 //! Display support for the Inseego MiFi M2100 5G UW.
 //!
 //! The M2100 has a 320x240 framebuffer at `/dev/fb0`, but writes to it never
-//! reach the panel: the vendor's Qt UI drives the display through a path that
-//! issues no ioctl we can replicate, `FBIOPAN_DISPLAY` fails with EINVAL
-//! (`yres_virtual == yres`, so there is no back buffer to flip), and neither
-//! `write()` nor `mmap` + `msync` produces a visible change. See FINDINGS.md.
+//! reach the panel: `write()` and `mmap` + `msync` both change the buffer with
+//! no visible effect, `FBIOPAN_DISPLAY` fails with EINVAL (`yres_virtual ==
+//! yres`, so there is no back buffer to flip), and tracing the vendor Qt UI
+//! shows it issuing no ioctl at all -- it writes to its mmap, so there is no
+//! commit path to replicate. See FINDINGS.md.
 //!
-//! What the device does have is a single user-controllable LED
-//! (`/sys/class/leds/blue-led`, `max_brightness` 255), so this driver signals
-//! state through it instead. That keeps the important property of the upstream
-//! displays: a user who is not looking at the web UI still gets told when
-//! something was detected.
+//! So this signals through the two indicators the device does expose: a single
+//! LED and a PWM buzzer.
 //!
-//! The device also has a PWM buzzer (`nvtl-buzzer`), which is sounded in time
-//! with the Morse so an alert is noticeable without looking at the device.
+//!   Recording        one brief LED blink every 3s, silent
+//!   Paused           dark, silent
+//!   WarningDetected  LED double-blink, repeating; buzzer only if enabled
 //!
-//!   Recording        - a brief heartbeat blink every few seconds, silent
-//!   Paused           - dark, silent
-//!   WarningDetected  - SOS in Morse (... --- ...) on both LED and buzzer,
-//!                      repeating until cleared
+//! ## Why the buzzer is off by default
 //!
-//! Two buzzer quirks, both confirmed on hardware:
-//!   * Writing 1 to `control` returns EIO but *does* take effect - the buzzer
+//! An audible alert in public tells everyone nearby that something was
+//! detected -- including, potentially, whoever is operating the thing you just
+//! detected. It also points at you. The quiet channels are the LED (a blinking
+//! light on a hotspot is unremarkable) and `ntfy_url`, which reaches a phone
+//! silently. The buzzer is for when you are somewhere private.
+//!
+//! Nothing here uses Morse. SOS is the one pattern a bystander might actually
+//! recognise, and you already know what your own device means, so it costs
+//! deniability and buys nothing.
+//!
+//! Double-tapping the power button toggles the buzzer at runtime; the state
+//! persists via a flag file so it survives a restart.
+//!
+//! ## Buzzer quirks, both confirmed on hardware
+//!
+//!   * Writing 1 to `control` returns EIO but *does* take effect -- the buzzer
 //!     sounds and `control` subsequently reads 1. The error is spurious.
 //!   * Writing 0 to `control` returns EIO and does *not* take effect. Writing 0
 //!     to `period` is the only reliable way to silence it.
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use log::{info, warn};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -42,10 +54,18 @@ const ON: &str = "255";
 const OFF: &str = "0";
 
 const BUZZER: &str = "/sys/devices/platform/soc:pwm_buzzer";
+/// Set when the buzzer is enabled, so the choice survives a restart.
+const BUZZER_FLAG: &str = "/data/rayhunter/buzzer_enabled";
 
-/// PWM period in nanoseconds, chosen per severity so the alert is
-/// distinguishable by ear alone: higher pitch = more urgent.
-/// 1_000_000 ns = 1 kHz, 500_000 = 2 kHz, 250_000 = 4 kHz.
+const INPUT_DEV: &str = "/dev/input/event0";
+/// Two 16-byte `input_event` structs per read on 32-bit ARM (the key event and
+/// its EV_SYN); the first event's value lands at offset 12.
+const INPUT_EVENT_SIZE: usize = 32;
+
+static BUZZER_ON: AtomicBool = AtomicBool::new(false);
+
+/// PWM period in nanoseconds, by severity, so an alert is identifiable by ear:
+/// higher pitch = more urgent. 1_000_000 ns = 1 kHz, 500_000 = 2 kHz, 250_000 = 4 kHz.
 fn buzzer_period_ns(event_type: EventType) -> &'static str {
     match event_type {
         EventType::Informational | EventType::Low => "1000000",
@@ -54,10 +74,6 @@ fn buzzer_period_ns(event_type: EventType) -> &'static str {
     }
 }
 
-/// Morse timing unit. A dot is one unit, a dash three, the gap between
-/// elements one, and the gap between letters three.
-const UNIT_MS: u64 = 180;
-
 async fn write_led(file: &str, value: &str) {
     let path = format!("{LED}/{file}");
     if let Err(e) = tokio::fs::write(&path, value).await {
@@ -65,8 +81,7 @@ async fn write_led(file: &str, value: &str) {
     }
 }
 
-/// Writes to the buzzer, tolerating the driver's spurious EIO on `control`
-/// (see the quirks noted above). Anything else is worth a warning.
+/// Writes to the buzzer, tolerating the driver's spurious EIO on `control`.
 async fn write_buzzer(file: &str, value: &str) {
     let path = format!("{BUZZER}/{file}");
     if let Err(e) = tokio::fs::write(&path, value).await {
@@ -81,32 +96,92 @@ async fn buzzer(on: bool, period_ns: &str) {
         write_buzzer("period", period_ns).await;
         write_buzzer("control", "1").await;
     } else {
-        // Writing control=0 returns EIO and leaves it sounding; period=0 works.
+        // control=0 returns EIO and leaves it sounding; period=0 works.
         write_buzzer("period", "0").await;
     }
 }
 
-/// A pattern is a list of (lit, duration) steps, played in a loop.
+/// A pattern is a list of (lit, duration_ms) steps, played in a loop.
+/// The warning pattern is a double-blink: distinguishable at a glance from the
+/// recording heartbeat, but not conspicuous to anyone else.
 fn pattern_for(state: &DisplayState) -> Vec<(bool, u64)> {
     match state {
         DisplayState::Paused => vec![(false, 1000)],
         DisplayState::Recording => vec![(true, 60), (false, 3000)],
-        DisplayState::WarningDetected { .. } => {
-            let mut p = Vec::new();
-            let mut letter = |counts: [u64; 3]| {
-                for (i, units) in counts.iter().enumerate() {
-                    p.push((true, units * UNIT_MS));
-                    // one unit between elements, three between letters
-                    p.push((false, if i == 2 { 3 * UNIT_MS } else { UNIT_MS }));
-                }
-            };
-            letter([1, 1, 1]); // S
-            letter([3, 3, 3]); // O
-            letter([1, 1, 1]); // S
-            p.push((false, 1200)); // pause before repeating
-            p
-        }
+        DisplayState::WarningDetected { .. } => vec![
+            (true, 120),
+            (false, 140),
+            (true, 120),
+            (false, 1200),
+        ],
     }
+}
+
+/// Watches the power button and toggles the buzzer on a double tap.
+/// evdev broadcasts, so reading here does not take the button away from the
+/// vendor UI or from rayhunter's own key_input service.
+fn spawn_buzzer_toggle(task_tracker: &TaskTracker, shutdown_token: CancellationToken) {
+    task_tracker.spawn(async move {
+        let mut file = match tokio::fs::File::open(INPUT_DEV).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("buzzer toggle disabled, cannot open {INPUT_DEV}: {e}");
+                return;
+            }
+        };
+
+        let mut buf = [0u8; INPUT_EVENT_SIZE];
+        let mut last_keyup: Option<Instant> = None;
+        let mut last_event: Option<Instant> = None;
+
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => return,
+                r = file.read_exact(&mut buf) => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            // The power button can emit bursts of events; ignore the repeats.
+            if let Some(prev) = last_event
+                && now.duration_since(prev) < Duration::from_millis(50)
+            {
+                last_event = Some(now);
+                continue;
+            }
+            last_event = Some(now);
+
+            // value == 0 is key-up
+            if buf[12] != 0 {
+                continue;
+            }
+
+            if let Some(prev) = last_keyup {
+                let gap = now.duration_since(prev);
+                if gap >= Duration::from_millis(100) && gap <= Duration::from_millis(800) {
+                    let enabled = !BUZZER_ON.fetch_xor(true, Ordering::Relaxed);
+                    if enabled {
+                        let _ = tokio::fs::write(BUZZER_FLAG, b"1").await;
+                        info!("buzzer enabled (double tap)");
+                        // One short chirp confirms it; turning it off is silent
+                        // by definition, so the LED is the only feedback there.
+                        buzzer(true, "500000").await;
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        buzzer(false, "0").await;
+                    } else {
+                        let _ = tokio::fs::remove_file(BUZZER_FLAG).await;
+                        info!("buzzer disabled (double tap)");
+                    }
+                    last_keyup = None;
+                    continue;
+                }
+            }
+            last_keyup = Some(now);
+        }
+    });
 }
 
 pub fn update_ui(
@@ -128,7 +203,15 @@ pub fn update_ui(
         return;
     }
 
-    info!("Starting M2100 LED UI on {LED}");
+    let buzzer_enabled = std::path::Path::new(BUZZER_FLAG).exists();
+    BUZZER_ON.store(buzzer_enabled, Ordering::Relaxed);
+    info!(
+        "Starting M2100 LED UI on {LED} (buzzer {}; double-tap power to toggle)",
+        if buzzer_enabled { "enabled" } else { "off" }
+    );
+
+    spawn_buzzer_toggle(task_tracker, shutdown_token.clone());
+
     task_tracker.spawn(async move {
         // Take the LED away from whatever trigger owns it (normally "timer").
         write_led("trigger", "none").await;
@@ -141,14 +224,15 @@ pub fn update_ui(
             };
             for (lit, ms) in pattern_for(&state) {
                 write_led("brightness", if lit { ON } else { OFF }).await;
-                if let Some(period) = tone {
+                if let Some(period) = tone
+                    && BUZZER_ON.load(Ordering::Relaxed)
+                {
                     buzzer(lit, period).await;
                 }
                 tokio::select! {
                     _ = shutdown_token.cancelled() => break 'outer,
                     next = ui_update_rx.recv() => {
                         match next {
-                            // A new state interrupts the current pattern immediately.
                             Some(s) => { state = s; continue 'outer; }
                             None => break 'outer,
                         }
@@ -158,7 +242,6 @@ pub fn update_ui(
             }
         }
 
-        // Hand the LED back to the vendor's trigger and silence the buzzer.
         buzzer(false, "0").await;
         write_led("brightness", OFF).await;
         write_led("trigger", "timer").await;
