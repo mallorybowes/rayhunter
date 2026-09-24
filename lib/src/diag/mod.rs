@@ -57,12 +57,46 @@ pub enum DataType {
     Other(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Error)]
+/// Bound how much of a message body can reach a log line.
+///
+/// The full payload is still carried on the error for programmatic use; this
+/// limits only what `Display` and `Debug` render. Printing the entire `Vec<u8>`
+/// on every parse failure is not viable on the embedded devices this runs on: a
+/// device emitting an unparseable *high-rate* message wrote 334 MB into the log
+/// on a 236 MB rootfs, filled the filesystem, and killed the recording task --
+/// silently, while the web UI carried on reporting healthy. A length plus the
+/// leading bytes is enough to identify the message and diagnose the failure.
+fn brief_payload(data: &[u8]) -> String {
+    const HEAD: usize = 16;
+    let head = data
+        .iter()
+        .take(HEAD)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if data.len() > HEAD {
+        format!("{} bytes [{head} ...]", data.len())
+    } else {
+        format!("{} bytes [{head}]", data.len())
+    }
+}
+
+#[derive(Clone, PartialEq, Error)]
 pub enum DiagParsingError {
-    #[error("Failed to parse Message: {0}, data: {1:?}")]
+    #[error("Failed to parse Message: {0}, data: {}", brief_payload(.1))]
     MessageParsingError(deku::DekuError, Vec<u8>),
-    #[error("HDLC decapsulation of message failed: {0}, data: {1:?}")]
+    #[error("HDLC decapsulation of message failed: {0}, data: {}", brief_payload(.1))]
     HdlcDecapsulationError(hdlc::HdlcError, Vec<u8>),
+}
+
+// Debug delegates to Display rather than being derived. A derived Debug would
+// print the whole payload, so any call site using `{:?}` would reintroduce the
+// problem -- which is exactly how it happened: the offending log line was
+// `error!("error parsing message: {e:?}")`.
+impl std::fmt::Debug for DiagParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 // this is sorta based on the params qcsuper uses, plus what seems to be used in

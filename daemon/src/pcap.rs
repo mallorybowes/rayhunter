@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use log::error;
+use log::{error, warn};
 use rayhunter::gsmtap::parser as gsmtap_parser;
 use rayhunter::pcap::{GpsPoint, GsmtapPcapWriter};
 use rayhunter::qmdl::QmdlMessageReader;
@@ -142,6 +142,12 @@ where
     let mut pcap_writer = GsmtapPcapWriter::new(writer).await?;
     pcap_writer.write_iface_header().await?;
 
+    // A message version this parser does not know can account for most of a
+    // capture, so one log line per failure is itself the problem. Log a few for
+    // diagnosis, then count the rest and report a single total.
+    const LOGGED_FAILURES: u64 = 5;
+    let mut parse_failures: u64 = 0;
+
     while let Some(maybe_msg) = reader.get_next_message().await? {
         match maybe_msg {
             Ok(msg) => {
@@ -154,8 +160,22 @@ where
                         .await?;
                 }
             }
-            Err(e) => error!("error parsing message: {e:?}"),
+            Err(e) => {
+                parse_failures += 1;
+                if parse_failures <= LOGGED_FAILURES {
+                    error!("error parsing message: {e}");
+                    if parse_failures == LOGGED_FAILURES {
+                        error!(
+                            "further parse errors in this export will be counted, not logged"
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    if parse_failures > 0 {
+        warn!("PCAP export skipped {parse_failures} unparseable messages");
     }
 
     Ok(())
