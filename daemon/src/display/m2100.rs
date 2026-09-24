@@ -35,6 +35,11 @@
 //!     sounds and `control` subsequently reads 1. The error is spurious.
 //!   * Writing 0 to `control` returns EIO and does *not* take effect. Writing 0
 //!     to `period` is the only reliable way to silence it.
+//!   * The transducer is a piezo with a resonant peak near **4.4 kHz**. Pitch is
+//!     freely settable (`period` is the raw PWM period in ns, so
+//!     `freq = 1e9 / period`), but loudness is not: tones far from resonance are
+//!     much quieter, and there is no `duty_cycle` attribute, so there is no
+//!     volume control at all. Keep alert tones in roughly 3.8-4.6 kHz.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -65,12 +70,23 @@ const INPUT_EVENT_SIZE: usize = 32;
 static BUZZER_ON: AtomicBool = AtomicBool::new(false);
 
 /// PWM period in nanoseconds, by severity, so an alert is identifiable by ear:
-/// higher pitch = more urgent. 1_000_000 ns = 1 kHz, 500_000 = 2 kHz, 250_000 = 4 kHz.
+/// higher pitch = more urgent.
+///
+/// All three sit inside the transducer's resonant band. Measured by sweeping
+/// 100 Hz - 10 kHz and listening: output peaks around **4.4 kHz** and falls off
+/// audibly above 5 kHz and below about 4 kHz -- an ordinary piezo response.
+/// An earlier octave-spaced scheme (1 / 2 / 4 kHz) put only the High tone on
+/// resonance, so the *least* urgent alert was also the quietest and easiest to
+/// sleep through. 3.8 / 4.2 / 4.6 kHz are all near peak loudness and were
+/// confirmed by ear to still be distinguishable from each other, including
+/// which direction the sequence moves.
+///
+/// 263_158 ns = 3.8 kHz, 238_095 = 4.2 kHz, 217_391 = 4.6 kHz.
 fn buzzer_period_ns(event_type: EventType) -> &'static str {
     match event_type {
-        EventType::Informational | EventType::Low => "1000000",
-        EventType::Medium => "500000",
-        EventType::High => "250000",
+        EventType::Informational | EventType::Low => "263158",
+        EventType::Medium => "238095",
+        EventType::High => "217391",
     }
 }
 
@@ -168,7 +184,7 @@ fn spawn_buzzer_toggle(task_tracker: &TaskTracker, shutdown_token: CancellationT
                         info!("buzzer enabled (double tap)");
                         // One short chirp confirms it; turning it off is silent
                         // by definition, so the LED is the only feedback there.
-                        buzzer(true, "500000").await;
+                        buzzer(true, "238095").await;
                         tokio::time::sleep(Duration::from_millis(120)).await;
                         buzzer(false, "0").await;
                     } else {
