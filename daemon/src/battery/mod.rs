@@ -11,6 +11,7 @@ use crate::{
     notifications::{Notification, NotificationType},
 };
 
+pub mod m2100;
 pub mod orbic;
 pub mod tmobile;
 pub mod tplink;
@@ -52,6 +53,7 @@ async fn get_level_from_percentage_file(path: &Path) -> Result<u8, RayhunterErro
 
 pub async fn get_battery_status(device: &Device) -> Result<BatteryState, RayhunterError> {
     Ok(match device {
+        Device::M2100 => m2100::get_battery_state().await?,
         Device::Orbic => orbic::get_battery_state().await?,
         Device::Wingtech => wingtech::get_battery_state().await?,
         Device::Tmobile => tmobile::get_battery_state().await?,
