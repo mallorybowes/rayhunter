@@ -136,8 +136,8 @@ mod tests {
     use super::*;
 
     fn assert_mac_gsmtap(packet: &Packet, expected_hexstr: Option<&str>) {
-        assert_eq!(packet.subpackets.len(), 1);
-        let subpacket = &packet.subpackets[0];
+        assert_eq!(packet.subpackets().len(), 1);
+        let subpacket = &packet.subpackets()[0];
         let result = mac_subpacket_to_gsmtap(&subpacket.body).unwrap();
         match (result, expected_hexstr) {
             (Some(msg), Some(hexstr)) => {

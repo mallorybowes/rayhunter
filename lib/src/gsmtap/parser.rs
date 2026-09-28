@@ -157,13 +157,13 @@ fn log_to_gsmtap(value: LogBody) -> Result<Option<GsmtapMessage>, GsmtapParserEr
             }))
         }
         LogBody::LteMacRachResponse { packet } => {
-            if packet.subpackets.len() > 1 {
+            if packet.subpackets().len() > 1 {
                 warn!(
                     "expected 1 MAC subpacket for LogBody::LteMacRachResponse, but got {}! ignoring all but the first",
-                    packet.subpackets.len()
+                    packet.subpackets().len()
                 );
             }
-            let Some(subpacket) = packet.subpackets.first() else {
+            let Some(subpacket) = packet.subpackets().first() else {
                 return Err(GsmtapParserError::InvalidLteMacRachResponse(
                     "no subpackets".to_string(),
                 ));

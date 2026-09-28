@@ -87,13 +87,25 @@ pub enum LogBody {
         data: ml1::neighbor_cells::Measurements,
     },
     #[deku(id = "0xb062")]
-    LteMacRachResponse { packet: mac::Packet },
+    LteMacRachResponse {
+        #[deku(ctx = "hdr_len")]
+        packet: mac::Packet,
+    },
     #[deku(id = "0xb063")]
-    LteMacDl { packet: mac::Packet },
+    LteMacDl {
+        #[deku(ctx = "hdr_len")]
+        packet: mac::Packet,
+    },
     #[deku(id = "0xb064")]
-    LteMacUl { packet: mac::Packet },
+    LteMacUl {
+        #[deku(ctx = "hdr_len")]
+        packet: mac::Packet,
+    },
     #[deku(id = "0xb114")]
-    LteLl1ServingCellTiming { data: ll1::ServingCellTiming },
+    LteLl1ServingCellTiming {
+        #[deku(ctx = "hdr_len")]
+        data: ll1::ServingCellTiming,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
@@ -168,6 +180,111 @@ pub(crate) mod test {
                 },
             }
         );
+    }
+
+    /// Real messages captured from an Inseego M2100 (Qualcomm SDX55), 2026-09-24.
+    /// This modem emits ServingCellTiming with version 161 and MAC DL with
+    /// version 49; upstream hard-asserts version == 1 for both, so every one of
+    /// them fails to parse. In one 16-hour capture that was 29,577 of 29,658
+    /// skipped messages -- 98.9% of them ServingCellTiming alone -- which no
+    /// analyser consumes, but which produced a 186MB error log from a 14.9MB
+    /// source and filled the device's rootfs.
+    const SERVING_CELL_TIMING_V161: &str = "10000c010c0114b100b537f4959d1201a1055c00a41dc41aa4059816c47a9816950100000000000003000000286d000000400b40480b0000667cffffc2e3ff3f706f666680808080000000000000000095050000000000000300000028b8000000400b40480b0000667cffffc2e3ff3f706f66668080808000000000000000009509000000000000030000002803010000400b40480b0000667cffffc2e3ff3f706f6666808080800000000000000000950d01000000000003000000294e010000400b40480b0000667cffffc2e3ff3f706f6666808080800000000000000000d4250000010000000300000017a2bb00f8ffff3f480b0000667cffffc2e3ff3f706f6666808080800000000000000000";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The same modem emits MAC DL (0xb063) as version 49. 245 of them in the
+    /// capture that produced the ServingCellTiming finding, and like that one
+    /// no analyser consumes it -- but an assert turns every one into a hard
+    /// parse failure for the whole message.
+    const MAC_DL_V49: &str = "10005002500263b049940b10979d12013100000001000100c1420000000000000000000000000000000000000000000000000000c2440000000000000000000000000000000000000000000000000000c30603000100000001000000010000000000000001000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000029000000000000004e610200100203003903004b2c740f14d8010000001000000001000000000000";
+
+    #[test]
+    fn test_mac_packet_with_an_unknown_version_still_parses() {
+        let data = unhex(MAC_DL_V49);
+        let msg = Message::from_bytes((&data, 0))
+            .expect("a MAC version this parser does not know must not fail the message")
+            .1;
+        match msg {
+            Message::Log {
+                log_type,
+                body: LogBody::LteMacDl { packet },
+                ..
+            } => {
+                assert_eq!(log_type, 0xb063);
+                assert_eq!(packet.version, 49);
+                // Nothing usable, but nothing lost either.
+                assert!(packet.subpackets().is_empty());
+            }
+            other => panic!("expected a MAC DL log, got {other:?}"),
+        }
+    }
+
+    /// "Kept as opaque bytes" is the design, so assert the bytes are there.
+    /// Without this, a variant that silently read nothing would pass.
+    #[test]
+    fn test_an_unsupported_mac_version_keeps_its_payload() {
+        let data = unhex(MAC_DL_V49);
+        let msg = Message::from_bytes((&data, 0)).unwrap().1;
+        let Message::Log {
+            inner_length,
+            body: LogBody::LteMacDl { packet },
+            ..
+        } = msg
+        else {
+            panic!("expected a MAC DL log");
+        };
+        match &packet.body {
+            mac::PacketBody::Unsupported { data } => {
+                // Everything after the version byte.
+                assert_eq!(data.len() as usize, inner_length as usize - 12 - 1);
+            }
+            other => panic!("expected an Unsupported body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_unsupported_serving_cell_timing_keeps_its_payload() {
+        let data = unhex(SERVING_CELL_TIMING_V161);
+        let msg = Message::from_bytes((&data, 0)).unwrap().1;
+        let Message::Log {
+            inner_length,
+            body: LogBody::LteLl1ServingCellTiming { data: sct },
+            ..
+        } = msg
+        else {
+            panic!("expected a ServingCellTiming log");
+        };
+        match &sct.body {
+            ll1::ServingCellTimingBody::Unsupported { data } => {
+                assert_eq!(data.len() as usize, inner_length as usize - 12 - 1);
+            }
+            other => panic!("expected an Unsupported body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_serving_cell_timing_with_an_unknown_version_still_parses() {
+        let data = unhex(SERVING_CELL_TIMING_V161);
+        let msg = Message::from_bytes((&data, 0))
+            .expect("a version this parser does not know must not fail the whole message")
+            .1;
+        match msg {
+            Message::Log {
+                log_type,
+                body: LogBody::LteLl1ServingCellTiming { data },
+                ..
+            } => {
+                assert_eq!(log_type, 0xb114);
+                assert_eq!(data.version, 161);
+            }
+            other => panic!("expected a ServingCellTiming log, got {other:?}"),
+        }
     }
 
     #[test]

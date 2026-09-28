@@ -1,10 +1,42 @@
 use deku::prelude::*;
 
+/// Qualcomm emits several incompatible layouts under log code 0xb114, tagged by
+/// a leading version byte. Upstream implements version 1 and asserts on it,
+/// which turns every other version into a hard parse failure for the whole
+/// message.
+///
+/// The Inseego M2100 (Qualcomm SDX55) emits version 161. In one 16-hour capture
+/// that was 29,332 failures -- 98.9% of every skipped message -- producing a
+/// 186MB error log from a 14.9MB source and filling the device's rootfs. No
+/// analyser consumes this log type, so the entire cost was noise.
+///
+/// An unrecognised version is now kept as opaque bytes rather than failing: it
+/// leaves the error path, and the payload is retained in case the layout is
+/// ever worked out.
+#[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
+#[deku(ctx = "hdr_len: u16")]
+pub struct ServingCellTiming {
+    pub version: u8,
+    #[deku(ctx = "*version, hdr_len.saturating_sub(1)")]
+    pub body: ServingCellTimingBody,
+}
+
+#[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
+#[deku(ctx = "version: u8, len: u16", id = "version")]
+pub enum ServingCellTimingBody {
+    #[deku(id = "1")]
+    V1(V1),
+    /// Unknown layout, not unknown data -- keep the bytes.
+    #[deku(id_pat = "_")]
+    Unsupported {
+        #[deku(count = "len")]
+        data: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
 #[deku(bit_order = "lsb")]
-pub struct ServingCellTiming {
-    #[deku(assert_eq = "1")]
-    pub version: u8,
+pub struct V1 {
     #[deku(bits = 5, assert = "(1..=20).contains(num_records)")]
     pub num_records: u8,
     #[deku(bits = 4, assert = "*starting_sub_fn <= 9")]

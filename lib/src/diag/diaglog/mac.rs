@@ -4,13 +4,49 @@
 
 use deku::prelude::*;
 
+/// Qualcomm emits several incompatible layouts under these MAC log codes and
+/// tags them with a leading version byte. Upstream implements version 1 and
+/// asserts on it, which turns every other version into a hard parse failure
+/// for the whole message.
+///
+/// The Inseego M2100 (Qualcomm SDX55) emits MAC DL (0xb063) as version **49**,
+/// while MAC UL (0xb064) and RACH (0xb062) on the same device are version 1 and
+/// parse normally -- 245 failures in one 16-hour capture. Nothing consumes MAC
+/// DL, so an unrecognised version is kept as opaque bytes rather than failing.
 #[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
+#[deku(ctx = "hdr_len: u16")]
 pub struct Packet {
-    #[deku(assert_eq = "1")]
     pub version: u8,
-    pub num_subpackets: u8,
-    #[deku(pad_bytes_before = "2", count = "num_subpackets")]
-    pub subpackets: Vec<Subpacket>,
+    #[deku(ctx = "*version, hdr_len.saturating_sub(1)")]
+    pub body: PacketBody,
+}
+
+#[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
+#[deku(ctx = "version: u8, len: u16", id = "version")]
+pub enum PacketBody {
+    #[deku(id = "1")]
+    V1 {
+        num_subpackets: u8,
+        #[deku(pad_bytes_before = "2", count = "num_subpackets")]
+        subpackets: Vec<Subpacket>,
+    },
+    /// Unknown layout, not unknown data -- keep the bytes.
+    #[deku(id_pat = "_")]
+    Unsupported {
+        #[deku(count = "len")]
+        data: Vec<u8>,
+    },
+}
+
+impl Packet {
+    /// The subpackets, or an empty slice for a version this parser does not
+    /// know. Callers that only want the contents need not know the difference.
+    pub fn subpackets(&self) -> &[Subpacket] {
+        match &self.body {
+            PacketBody::V1 { subpackets, .. } => subpackets,
+            PacketBody::Unsupported { .. } => &[],
+        }
+    }
 }
 
 #[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
@@ -256,7 +292,7 @@ pub(crate) mod test {
 
     fn parse_rach_packet(bytes_str: &str) -> Packet {
         let (total_size, mut reader) = unhexlify(bytes_str);
-        let packet = Packet::from_reader_with_ctx(&mut reader, ()).unwrap();
+        let packet = Packet::from_reader_with_ctx(&mut reader, total_size as u16).unwrap();
         let leftover_bits = reader.rest().len();
         let leftover_bytes = total_size - reader.stream_position().unwrap() as usize;
         assert_eq!(leftover_bytes, 0);
@@ -273,16 +309,15 @@ pub(crate) mod test {
         additional_info: Option<AdditionalInfo>,
     ) {
         assert_eq!(packet.version, 0x01);
-        assert_eq!(packet.num_subpackets, 1);
-        assert_eq!(packet.subpackets.len(), 1);
-        if let SubpacketBody::RachAttempt(attempt) = &packet.subpackets[0].body {
+        assert_eq!(packet.subpackets().len(), 1);
+        if let SubpacketBody::RachAttempt(attempt) = &packet.subpackets()[0].body {
             assert_eq!(attempt.header, header);
             assert_eq!(attempt.get_msg1(), msg1.as_ref());
             assert_eq!(attempt.get_msg2(), msg2.as_ref());
             assert_eq!(attempt.get_msg3(), msg3.as_ref());
             assert_eq!(attempt.additional_info, additional_info);
         } else {
-            panic!("not rach attempt {:?}", packet.subpackets[0].body);
+            panic!("not rach attempt {:?}", packet.subpackets()[0].body);
         }
     }
 
