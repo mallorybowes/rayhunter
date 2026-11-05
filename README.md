@@ -5,7 +5,7 @@
 
 ## Rayhunter on the Inseego M2100
 
-This branch (`m2100-support`) runs Rayhunter on the M2100: it captures and analyses live LTE traffic and alerts on detections. The full story of the port, including what we found, what we verified and where we stopped, is in the write-up: **[Rayhunter on the Inseego M2100: field notes from a port](https://tpc.institute/projects/rayhunter-m2100)**.
+This branch (`diag-zero-pad`) is [`m2100-support`](https://github.com/mallorybowes/rayhunter/tree/m2100-support) plus a fix to how the diag logging ioctl is called (last row of the table below). It runs Rayhunter on the M2100: it captures and analyses live LTE traffic and alerts on detections. The full story of the port, including what we found, what we verified and where we stopped, is in the write-up: **[Rayhunter on the Inseego M2100: field notes from a port](https://tpc.institute/projects/rayhunter-m2100)**.
 
 **What this branch adds to upstream Rayhunter**
 
@@ -15,6 +15,7 @@ This branch (`m2100-support`) runs Rayhunter on the M2100: it captures and analy
 | Strip the 8-byte multi-radio header before parsing | [`6a4b0c6`](https://github.com/mallorybowes/rayhunter/commit/6a4b0c6) | modems that send it |
 | Keep log versions the parser doesn't know (`0xb114`, `0xb063`) | [`aa04b06`](https://github.com/mallorybowes/rayhunter/commit/aa04b06) | modems sending newer log versions |
 | M2100 device support: LED and buzzer alerts, battery | [`5789a1c`](https://github.com/mallorybowes/rayhunter/commit/5789a1c), [`46ae901`](https://github.com/mallorybowes/rayhunter/commit/46ae901) | M2100 |
+| Zero-pad every diag logging ioctl attempt, and log diag setup failures. The ioctl carries no length, so the shorter attempts handed the driver stack junk, which made it hang on a hot restart or when started after the vendor modem stack | [`9f85107`](https://github.com/mallorybowes/rayhunter/commit/9f85107) | tested on the M2100 and a Pixel 4 XL (LineageOS); likely any 4.14-era Qualcomm device |
 
 Bounded parse-error logging, which stops a full log from silently ending a recording, is on its own branch: [`fix-parse-error-log-volume`](https://github.com/mallorybowes/rayhunter/tree/fix-parse-error-log-volume). The device-independent fixes were reported to the Rayhunter maintainers in [discussion #560](https://github.com/EFForg/rayhunter/discussions/560).
 
