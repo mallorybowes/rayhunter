@@ -448,7 +448,7 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
             if r == 0 { return Ok(()); }
 
             // 24-byte with device_mask
-            let mut p3 = DiagLoggingModeParamV3 {
+            let p3 = DiagLoggingModeParamV3 {
                 req_mode: mode, peripheral_mask: mask, pd_mask: 0,
                 mode_param: 0, diag_id: 0, pd_val: 0, reserved: 0, peripheral: 0, device_mask: 1,
             };
