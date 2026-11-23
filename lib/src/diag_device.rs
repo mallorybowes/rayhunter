@@ -7,7 +7,7 @@ use crate::{Device, log_codes};
 
 use deku::prelude::*;
 use futures::TryStream;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -89,6 +89,12 @@ const DIAG_IOCTL_SWITCH_LOGGING: u64 = 7;
 
 pub struct DiagDevice {
     file: File,
+    /// A second handle on the same open /dev/diag, used only for writes.
+    /// tokio's `File` runs one blocking operation at a time, so a write on
+    /// `file` would queue behind a read that is still parked in the kernel
+    /// (one that [`DiagDevice::request_reply`] stopped waiting for), and the
+    /// re-sent request would never go out.
+    write_file: File,
     read_buf: Vec<u8>,
     use_mdm: i32,
 }
@@ -147,10 +153,15 @@ impl DiagDevice {
 
         enable_frame_readwrite(fd, MEMORY_DEVICE_MODE, configured_device)?;
         let use_mdm = determine_use_mdm(fd)?;
+        let write_file = diag_file
+            .try_clone()
+            .await
+            .map_err(DiagDeviceError::OpenDiagDeviceError)?;
 
         Ok(DiagDevice {
             read_buf: vec![0; BUFFER_LEN],
             file: diag_file,
+            write_file,
             use_mdm,
         })
     }
@@ -197,7 +208,7 @@ impl DiagDevice {
         }
         .to_bytes()
         .expect("Failed to serialize RequestContainer");
-        if let Err(err) = self.file.write(&buf).await {
+        if let Err(err) = self.write_file.write(&buf).await {
             // For reasons I don't entirely understand, calls to write(2) on
             // /dev/diag always return 0 bytes written, though the written
             // requests end up being interpreted. As such, we're not concerned
@@ -206,7 +217,7 @@ impl DiagDevice {
                 return Err(DiagDeviceError::DeviceWriteFailed(err));
             }
         }
-        if let Err(err) = self.file.flush().await
+        if let Err(err) = self.write_file.flush().await
             && err.kind() != ErrorKind::WriteZero
         {
             return Err(DiagDeviceError::DeviceWriteFailed(err));
@@ -302,7 +313,23 @@ impl DiagDevice {
 
     pub async fn config_logs(&mut self) -> DiagResult<()> {
         info!("retrieving diag logging capabilities...");
-        let log_mask_sizes = self.retrieve_id_ranges().await?;
+        let log_mask_sizes = match self.retrieve_id_ranges().await {
+            // DIAG_IOCTL_REMOTE_DEV can report a remote device that never
+            // answers. On the Inseego M2100 (SDX55, kernel 4.14) the mask reads
+            // 0x0 when rayhunter starts early in boot but 0x1 once boot has
+            // finished, and every request routed to that remote goes
+            // unanswered. The local modem answers the same requests, so try it
+            // before giving up.
+            Err(DiagDeviceError::NoResponse(_)) if self.use_mdm > 0 => {
+                warn!(
+                    "no reply with requests routed to the remote device (mask {:#x}); retrying on the local modem",
+                    self.use_mdm
+                );
+                self.use_mdm = 0;
+                self.retrieve_id_ranges().await?
+            }
+            result => result?,
+        };
 
         for (log_type, &log_mask_bitsize) in log_mask_sizes.iter().enumerate() {
             if log_mask_bitsize > 0 {
@@ -471,10 +498,16 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
 // Unsure of what MDM actually stands for, but if `use_mdm` is > 0, then
 // an additional mask is included in every diag request
 fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
-    let use_mdm: i32 = 0;
+    // The driver writes the remote-device mask through this pointer, so the
+    // binding must be mutable. Passing an immutable binding as `*const` lets
+    // the compiler assume it still holds 0 after the call.
+    let mut use_mdm: i32 = 0;
     unsafe {
-        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &use_mdm as *const i32) < 0 {
-            let msg = format!("DIAG_IOCTL_REMOTE_DEV ioctl failed with error code {}", 0);
+        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &mut use_mdm as *mut i32) < 0 {
+            let msg = format!(
+                "DIAG_IOCTL_REMOTE_DEV ioctl failed: {}",
+                std::io::Error::last_os_error()
+            );
             return Err(DiagDeviceError::InitializationFailed(msg));
         }
     }
@@ -484,6 +517,45 @@ fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why writes go through a second handle. A FIFO with no writer stands in
+    /// for /dev/diag with no reply pending: a read we stop waiting for stays
+    /// in flight, a write on the same tokio `File` queues behind it, and a
+    /// write on a `try_clone` of that file goes straight out.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_write_on_a_cloned_handle_does_not_wait_behind_a_parked_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // O_RDWR on a FIFO never blocks the open and keeps a writer present,
+        // so the read below waits for data instead of seeing EOF.
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut write_file = file.try_clone().await.unwrap();
+        let short = Duration::from_millis(200);
+
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(short, file.read(&mut buf));
+        assert!(read.await.is_err(), "nothing to read yet");
+
+        let same_handle = tokio::time::timeout(short, async {
+            file.write_all(b"x").await.unwrap();
+            file.flush().await.unwrap();
+        });
+        assert!(same_handle.await.is_err(), "same-handle write should queue");
+
+        let cloned = tokio::time::timeout(short, async {
+            write_file.write_all(b"y").await.unwrap();
+            write_file.flush().await.unwrap();
+        });
+        assert!(cloned.await.is_ok(), "cloned-handle write should go out");
+    }
 
     #[test]
     fn padded_keeps_the_struct_and_zeroes_what_the_driver_reads_past_it() {
